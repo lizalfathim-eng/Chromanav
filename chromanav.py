@@ -1,191 +1,325 @@
+import os
+import queue
+import re
+import threading
+import time
+
 import cv2
 import numpy as np
 import pyttsx3
-from ultralytics import YOLO
 import tkinter as tk
 from tkinter import ttk
-from threading import Thread
+from ultralytics import YOLO
 
-# Initialize text-to-speech engine
-engine = pyttsx3.init()
 
-# Load YOLOv8 pre-trained model
-try:
-    model = YOLO("yolov8n.pt")  # Ensure this file exists in the directory
-    print("✅ YOLOv8 Model Loaded Successfully!")
-except Exception as e:
-    print(f"❌ Error Loading Model: {e}")
-    exit()
+MODEL_PATH = os.environ.get("CHROMANAV_MODEL", "yolov8n.pt")
+CONFIDENCE_THRESHOLD = 0.4
+ANNOUNCEMENT_COOLDOWN = 5.0
+TRAFFIC_LIGHT_COOLDOWN = 2.0
 
-# Define Indian traffic sign classes
-traffic_sign_classes = {
-    9: "Traffic Light",
-    11: "Stop",
-    12: "Speed Limit",
-    13: "Pedestrian Crossing",
-    14: "No Parking",
-    15: "One Way",
-    16: "Give Way",  # Equivalent to Yield Sign
-    17: "School Zone",
-    18: "U-Turn Prohibited",
-    19: "Horn Prohibited",
-    20: "Compulsory Left/Right",
-    21: "Hospital Ahead",
-    22: "Rest Area",
-    23: "Toll Booth Ahead",
-    24: "Road Work",
-    25: "Slippery Road",
+TRAFFIC_SIGN_LABELS = {
+    "stop": "Stop",
+    "stop sign": "Stop",
+    "speed limit": "Speed Limit",
+    "pedestrian crossing": "Pedestrian Crossing",
+    "crosswalk": "Pedestrian Crossing",
+    "zebra crossing": "Pedestrian Crossing",
+    "no parking": "No Parking",
+    "one way": "One Way",
+    "give way": "Give Way",
+    "yield": "Give Way",
+    "school zone": "School Zone",
+    "u turn prohibited": "U-Turn Prohibited",
+    "no u turn": "U-Turn Prohibited",
+    "horn prohibited": "Horn Prohibited",
+    "compulsory left right": "Compulsory Left/Right",
+    "hospital ahead": "Hospital Ahead",
+    "rest area": "Rest Area",
+    "toll booth ahead": "Toll Booth Ahead",
+    "road work": "Road Work",
+    "slippery road": "Slippery Road",
 }
 
-# Define RGB color constants
 RED = (0, 0, 255)
 YELLOW = (0, 255, 255)
 GREEN = (0, 255, 0)
-BLUE = (255, 0, 0)  # Used in Indian information signs
+SIGN_COLOR = (255, 180, 0)
 WHITE = (255, 255, 255)
 
-# Define color mapping for Indian traffic signs
-color_mapping = {
-    "Stop": RED,
-    "No Parking": RED,
-    "One Way": RED,
-    "Give Way": YELLOW,
-    "Speed Limit": YELLOW,
-    "School Zone": YELLOW,
-    "Pedestrian Crossing": YELLOW,
-    "U-Turn Prohibited": RED,
-    "Horn Prohibited": RED,
-    "Compulsory Left/Right": BLUE,
-    "Hospital Ahead": BLUE,
-    "Rest Area": BLUE,
-    "Toll Booth Ahead": BLUE,
-    "Road Work": YELLOW,
-    "Slippery Road": YELLOW,
-}
 
-# HSV color ranges for traffic light detection
+def normalize_class_name(class_name):
+    normalized = re.sub(r"[_-]+", " ", class_name.lower())
+    return re.sub(r"\s+", " ", normalized).strip()
+
+
+def canonical_detection_label(class_name):
+    """Return labels supported by this app, not arbitrary COCO class names."""
+    normalized = normalize_class_name(class_name)
+    if normalized == "traffic light":
+        return "Traffic Light"
+    if normalized.startswith("speed limit "):
+        return "Speed Limit"
+    return TRAFFIC_SIGN_LABELS.get(normalized)
+
+
 def detect_traffic_light_color(crop_img):
-    hsv = cv2.cvtColor(crop_img, cv2.COLOR_BGR2HSV)
+    if crop_img is None or crop_img.size == 0:
+        return None
 
-    # Define color ranges (HSV)
-    color_ranges = {
-        "Red Light": [(0, 120, 70), (10, 255, 255)],
-        "Yellow Light": [(20, 100, 100), (30, 255, 255)],
-        "Green Light": [(40, 100, 100), (90, 255, 255)]
+    hsv = cv2.cvtColor(crop_img, cv2.COLOR_BGR2HSV)
+    masks = {
+        "Red Light": (
+            cv2.inRange(hsv, np.array((0, 100, 80)), np.array((10, 255, 255))),
+            cv2.inRange(hsv, np.array((170, 100, 80)), np.array((180, 255, 255))),
+        ),
+        "Yellow Light": (
+            cv2.inRange(hsv, np.array((15, 100, 80)), np.array((35, 255, 255))),
+        ),
+        "Green Light": (
+            cv2.inRange(hsv, np.array((36, 80, 60)), np.array((90, 255, 255))),
+        ),
     }
 
-    for color_name, (lower, upper) in color_ranges.items():
-        mask = cv2.inRange(hsv, np.array(lower), np.array(upper))
-        if cv2.countNonZero(mask) > 50:  # Threshold to confirm color presence
-            return color_name
+    area = crop_img.shape[0] * crop_img.shape[1]
+    minimum_pixels = max(3, int(area * 0.015))
+    color_counts = {
+        color: sum(cv2.countNonZero(mask) for mask in color_masks)
+        for color, color_masks in masks.items()
+    }
+    color, count = max(color_counts.items(), key=lambda item: item[1])
+    return color if count >= minimum_pixels else None
 
-    return None
 
-# Function to start detection
-def start_detection():
-    global running
-    running = True
-    cap = cv2.VideoCapture(0)  # 0 = Default webcam
+def class_name_for(model, class_id):
+    names = model.names
+    if isinstance(names, dict):
+        return str(names.get(class_id, ""))
+    if 0 <= class_id < len(names):
+        return str(names[class_id])
+    return ""
 
-    if not cap.isOpened():
-        print("❌ Error: Could not open webcam")
+
+def run_detection(stop_event, speech_queue, status_queue):
+    camera = None
+    failed = False
+    try:
+        status_queue.put("Loading detection model...")
+        model = YOLO(MODEL_PATH)
+        camera = cv2.VideoCapture(0)
+        if not camera.isOpened():
+            raise RuntimeError("Could not open the webcam.")
+
+        camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        status_queue.put("Detecting. Press q in the video window to quit.")
+        last_announced = {}
+
+        while not stop_event.is_set():
+            captured, frame = camera.read()
+            if not captured:
+                raise RuntimeError("Failed to capture a frame from the webcam.")
+
+            results = model(frame, verbose=False)
+            detected_labels = set()
+
+            for result in results:
+                if result.boxes is None:
+                    continue
+                for box in result.boxes:
+                    confidence = float(box.conf[0])
+                    if confidence < CONFIDENCE_THRESHOLD:
+                        continue
+
+                    class_id = int(box.cls[0])
+                    class_name = class_name_for(model, class_id)
+                    label = canonical_detection_label(class_name)
+                    if label is None:
+                        continue
+
+                    x1, y1, x2, y2 = map(int, box.xyxy[0])
+                    height, width = frame.shape[:2]
+                    x1, x2 = max(0, x1), min(width, x2)
+                    y1, y2 = max(0, y1), min(height, y2)
+                    if x2 <= x1 or y2 <= y1:
+                        continue
+
+                    if label == "Traffic Light":
+                        light_color = detect_traffic_light_color(frame[y1:y2, x1:x2])
+                        label = light_color or label
+
+                    detected_labels.add(label)
+                    color = (
+                        RED if label == "Red Light"
+                        else YELLOW if label == "Yellow Light"
+                        else GREEN if label == "Green Light"
+                        else SIGN_COLOR if label != "Traffic Light"
+                        else WHITE
+                    )
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                    cv2.putText(
+                        frame,
+                        f"{label} {confidence:.0%}",
+                        (x1, max(20, y1 - 8)),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6,
+                        color,
+                        2,
+                    )
+
+            now = time.monotonic()
+            ready_to_announce = []
+            for label in sorted(detected_labels):
+                cooldown = (
+                    TRAFFIC_LIGHT_COOLDOWN
+                    if label in ("Red Light", "Yellow Light", "Green Light", "Traffic Light")
+                    else ANNOUNCEMENT_COOLDOWN
+                )
+                if now - last_announced.get(label, float("-inf")) >= cooldown:
+                    ready_to_announce.append(label)
+                    last_announced[label] = now
+
+            if ready_to_announce:
+                message = ", ".join(ready_to_announce)
+                print(f"Detected: {message}")
+                try:
+                    speech_queue.put_nowait(message)
+                except queue.Full:
+                    try:
+                        speech_queue.get_nowait()
+                    except queue.Empty:
+                        pass
+                    speech_queue.put_nowait(message)
+
+            cv2.imshow("ChromaNav - Traffic Sign & Light Detection", frame)
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                stop_event.set()
+    except Exception as error:
+        failed = True
+        status_queue.put(f"Detection error: {error}")
+        print(f"Detection error: {error}")
+    finally:
+        if camera is not None:
+            camera.release()
+        cv2.destroyAllWindows()
+        if not failed:
+            status_queue.put("Status: Stopped")
+
+
+def speech_worker(speech_queue, status_queue):
+    try:
+        engine = pyttsx3.init()
+    except Exception as error:
+        status_queue.put(f"Voice output unavailable: {error}")
+        print(f"Voice output unavailable: {error}")
         return
 
-    while running:
-        ret, frame = cap.read()
-        if not ret:
-            print("❌ Failed to capture video")
-            break
-
-        # Run YOLO object detection
-        results = model(frame)
-
-        detected_objects = []
-        
-        for r in results:
-            for box in r.boxes:
-                cls = int(box.cls[0])  # Class ID
-                conf = float(box.conf[0])  # Confidence score
-                x1, y1, x2, y2 = map(int, box.xyxy[0])  # Bounding box
-
-                # Traffic light detection (color analysis)
-                if cls == 9 and conf > 0.4:  # Traffic light ID
-                    traffic_light_crop = frame[y1:y2, x1:x2]  # Crop detected traffic light
-                    light_color = detect_traffic_light_color(traffic_light_crop)
-                    
-                    if light_color:
-                        detected_objects.append(light_color)
-                        label = light_color
-                        color = RED if "Red" in light_color else GREEN if "Green" in light_color else YELLOW
-                    else:
-                        label = "Traffic Light"
-                        color = WHITE  # Unknown color
-                
-                # Traffic signs detection
-                elif cls in traffic_sign_classes and conf > 0.4:
-                    label = traffic_sign_classes[cls]
-                    detected_objects.append(label)
-
-                    # Get color from dictionary, default to green
-                    color = color_mapping.get(label, GREEN)
-
-                else:
-                    continue
-
-                # Draw bounding box and label
-                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-                cv2.putText(frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
-
-        # Voice feedback for detected signs and traffic light colors
-        if detected_objects:
-            message = f"Detected: {', '.join(detected_objects)}"
-            print(message)
+    while True:
+        message = speech_queue.get()
+        if message is None:
+            return
+        try:
             engine.say(message)
             engine.runAndWait()
+        except Exception as error:
+            status_queue.put(f"Voice output error: {error}")
+            print(f"Voice output error: {error}")
+            return
 
-        # Show video feed
-        cv2.imshow("Indian Traffic Sign & Light Detection", frame)
 
-        # Press 'q' to quit
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
+def main():
+    root = tk.Tk()
+    root.title("ChromaNav Traffic Sign & Light Detection")
+    root.geometry("500x320")
+    root.configure(bg="#2E2E2E")
 
-    cap.release()
-    cv2.destroyAllWindows()
+    status_queue = queue.Queue()
+    speech_queue = queue.Queue(maxsize=1)
+    stop_event = threading.Event()
+    detection_thread = None
+    threading.Thread(
+        target=speech_worker,
+        args=(speech_queue, status_queue),
+        daemon=True,
+    ).start()
 
-# Function to stop detection
-def stop_detection():
-    global running
-    running = False
+    heading_label = tk.Label(
+        root,
+        text="ChromaNav",
+        font=("Helvetica", 28, "bold"),
+        bg="#2E2E2E",
+        fg="#FFFFFF",
+    )
+    heading_label.pack(pady=30)
 
-# Create the main window
-root = tk.Tk()
-root.title("Traffic Sign & Light Detection")
-root.geometry("500x400")
-root.configure(bg="#2E2E2E")  # Dark background color
+    button_frame = tk.Frame(root, bg="#2E2E2E")
+    button_frame.pack(pady=20)
+    status_label = tk.Label(
+        root,
+        text="Status: Ready",
+        font=("Helvetica", 12),
+        bg="#2E2E2E",
+        fg="#FFFFFF",
+    )
+    status_label.pack(pady=10)
 
-# Add a heading label
-heading_label = tk.Label(root, text="ChromaNav", font=("Helvetica", 28, "bold"), bg="#2E2E2E", fg="#FFFFFF")
-heading_label.pack(pady=20)
+    def start_detection():
+        nonlocal detection_thread
+        if detection_thread is not None and detection_thread.is_alive():
+            return
+        stop_event.clear()
+        detection_thread = threading.Thread(
+            target=run_detection,
+            args=(stop_event, speech_queue, status_queue),
+            daemon=True,
+        )
+        detection_thread.start()
+        status_label.config(text="Status: Starting...")
+        start_button.config(state=tk.DISABLED)
 
-# Create a frame for buttons
-button_frame = tk.Frame(root, bg="#2E2E2E")
-button_frame.pack(pady=20)
+    def stop_detection():
+        stop_event.set()
+        status_label.config(text="Status: Stopping...")
 
-# Create Start Detection button
-start_button = ttk.Button(button_frame, text="Start Detection", command=lambda: Thread(target=start_detection).start())
-start_button.pack(side=tk.LEFT, padx=20, pady=10, ipadx=10, ipady=5)
+    def poll_status():
+        while True:
+            try:
+                message = status_queue.get_nowait()
+            except queue.Empty:
+                break
+            status_label.config(text=message)
+        if detection_thread is None or not detection_thread.is_alive():
+            start_button.config(state=tk.NORMAL)
+        root.after(200, poll_status)
 
-# Create Stop Detection button
-stop_button = ttk.Button(button_frame, text="Stop Detection", command=stop_detection)
-stop_button.pack(side=tk.LEFT, padx=20, pady=10, ipadx=10, ipady=5)
+    def close_app():
+        stop_event.set()
+        try:
+            while True:
+                speech_queue.get_nowait()
+        except queue.Empty:
+            pass
+        try:
+            speech_queue.put_nowait(None)
+        except queue.Full:
+            pass
+        root.destroy()
 
-# Add a status label
-status_label = tk.Label(root, text="Status: Ready", font=("Helvetica", 12), bg="#2E2E2E", fg="#FFFFFF")
-status_label.pack(pady=10)
+    start_button = ttk.Button(
+        button_frame,
+        text="Start Detection",
+        command=start_detection,
+    )
+    start_button.pack(side=tk.LEFT, padx=20, pady=10, ipadx=10, ipady=5)
+    stop_button = ttk.Button(
+        button_frame,
+        text="Stop Detection",
+        command=stop_detection,
+    )
+    stop_button.pack(side=tk.LEFT, padx=20, pady=10, ipadx=10, ipady=5)
 
-# Initialize running variable
-running = False
+    root.protocol("WM_DELETE_WINDOW", close_app)
+    root.after(200, poll_status)
+    root.mainloop()
 
-# Start the GUI event loop
-root.mainloop()
+
+if __name__ == "__main__":
+    main()
