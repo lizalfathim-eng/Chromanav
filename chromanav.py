@@ -12,10 +12,14 @@ from tkinter import ttk
 from ultralytics import YOLO
 
 
-MODEL_PATH = os.environ.get("CHROMANAV_MODEL", "yolov8n.pt")
-CONFIDENCE_THRESHOLD = 0.4
+MODEL_PATH = os.environ.get(
+    "CHROMANAV_MODEL",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "yolov8n.pt"),
+)
+CONFIDENCE_THRESHOLD = 0.25
+INFERENCE_SIZE = 960
 ANNOUNCEMENT_COOLDOWN = 5.0
-TRAFFIC_LIGHT_COOLDOWN = 2.0
+TRAFFIC_LIGHT_COOLDOWN = 3.0
 
 TRAFFIC_SIGN_LABELS = {
     "stop": "Stop",
@@ -55,7 +59,7 @@ def normalize_class_name(class_name):
 def canonical_detection_label(class_name):
     """Return labels supported by this app, not arbitrary COCO class names."""
     normalized = normalize_class_name(class_name)
-    if normalized == "traffic light":
+    if normalized in ("traffic light", "traffic lights", "traffic signal", "traffic signals"):
         return "Traffic Light"
     if normalized.startswith("speed limit "):
         return "Speed Limit"
@@ -80,14 +84,37 @@ def detect_traffic_light_color(crop_img):
         ),
     }
 
-    area = crop_img.shape[0] * crop_img.shape[1]
-    minimum_pixels = max(3, int(area * 0.015))
-    color_counts = {
-        color: sum(cv2.countNonZero(mask) for mask in color_masks)
-        for color, color_masks in masks.items()
+    height, width = crop_img.shape[:2]
+    thirds = (
+        (0, height // 3),
+        (height // 3, 2 * height // 3),
+        (2 * height // 3, height),
+    )
+    expected_positions = {
+        "Red Light": thirds[0],
+        "Yellow Light": thirds[1],
+        "Green Light": thirds[2],
     }
-    color, count = max(color_counts.items(), key=lambda item: item[1])
-    return color if count >= minimum_pixels else None
+
+    position_scores = {}
+    full_counts = {}
+    for color, color_masks in masks.items():
+        merged_mask = color_masks[0].copy()
+        for mask in color_masks[1:]:
+            merged_mask = cv2.bitwise_or(merged_mask, mask)
+        full_counts[color] = cv2.countNonZero(merged_mask)
+
+        top, bottom = expected_positions[color]
+        position_scores[color] = cv2.countNonZero(merged_mask[top:bottom, :])
+
+    if height >= 9:
+        color, count = max(position_scores.items(), key=lambda item: item[1])
+        zone_area = width * max(1, height // 3)
+        if count >= max(2, int(zone_area * 0.005)):
+            return color
+
+    color, count = max(full_counts.items(), key=lambda item: item[1])
+    return color if count >= max(3, int(height * width * 0.005)) else None
 
 
 def class_name_for(model, class_id):
@@ -105,6 +132,8 @@ def run_detection(stop_event, speech_queue, status_queue):
     try:
         status_queue.put("Loading detection model...")
         model = YOLO(MODEL_PATH)
+        status_queue.put(f"Model loaded: {os.path.basename(MODEL_PATH)}")
+        print(f"Model loaded: {MODEL_PATH}")
         camera = cv2.VideoCapture(0)
         if not camera.isOpened():
             raise RuntimeError("Could not open the webcam.")
@@ -112,13 +141,17 @@ def run_detection(stop_event, speech_queue, status_queue):
         camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         status_queue.put("Detecting. Press q in the video window to quit.")
         last_announced = {}
-
         while not stop_event.is_set():
             captured, frame = camera.read()
             if not captured:
                 raise RuntimeError("Failed to capture a frame from the webcam.")
 
-            results = model(frame, verbose=False)
+            results = model(
+                frame,
+                imgsz=INFERENCE_SIZE,
+                conf=CONFIDENCE_THRESHOLD,
+                verbose=False,
+            )
             detected_labels = set()
 
             for result in results:
@@ -126,9 +159,6 @@ def run_detection(stop_event, speech_queue, status_queue):
                     continue
                 for box in result.boxes:
                     confidence = float(box.conf[0])
-                    if confidence < CONFIDENCE_THRESHOLD:
-                        continue
-
                     class_id = int(box.cls[0])
                     class_name = class_name_for(model, class_id)
                     label = canonical_detection_label(class_name)
@@ -175,19 +205,14 @@ def run_detection(stop_event, speech_queue, status_queue):
                 )
                 if now - last_announced.get(label, float("-inf")) >= cooldown:
                     ready_to_announce.append(label)
-                    last_announced[label] = now
 
             if ready_to_announce:
                 message = ", ".join(ready_to_announce)
                 print(f"Detected: {message}")
-                try:
-                    speech_queue.put_nowait(message)
-                except queue.Full:
-                    try:
-                        speech_queue.get_nowait()
-                    except queue.Empty:
-                        pass
-                    speech_queue.put_nowait(message)
+                status_queue.put(f"Detected: {message} - sending to voice")
+                speech_queue.put((10, time.monotonic_ns(), message))
+                for label in ready_to_announce:
+                    last_announced[label] = now
 
             cv2.imshow("ChromaNav - Traffic Sign & Light Detection", frame)
             if cv2.waitKey(1) & 0xFF == ord("q"):
@@ -204,23 +229,27 @@ def run_detection(stop_event, speech_queue, status_queue):
             status_queue.put("Status: Stopped")
 
 
-def speech_worker(speech_queue, status_queue):
+def speech_worker(speech_queue, voice_status_queue):
     try:
-        engine = pyttsx3.init()
+        engine = pyttsx3.init("sapi5") if os.name == "nt" else pyttsx3.init()
+        engine.setProperty("rate", 175)
+        voice_status_queue.put("Speech engine initialized")
     except Exception as error:
-        status_queue.put(f"Voice output unavailable: {error}")
+        voice_status_queue.put(f"Voice output unavailable: {error}")
         print(f"Voice output unavailable: {error}")
         return
 
     while True:
-        message = speech_queue.get()
+        _, _, message = speech_queue.get()
         if message is None:
             return
         try:
+            voice_status_queue.put(f"Speaking: {message}")
             engine.say(message)
             engine.runAndWait()
+            voice_status_queue.put(f"Spoken: {message}")
         except Exception as error:
-            status_queue.put(f"Voice output error: {error}")
+            voice_status_queue.put(f"Voice output error: {error}")
             print(f"Voice output error: {error}")
             return
 
@@ -232,12 +261,13 @@ def main():
     root.configure(bg="#2E2E2E")
 
     status_queue = queue.Queue()
-    speech_queue = queue.Queue(maxsize=1)
+    voice_status_queue = queue.Queue()
+    speech_queue = queue.PriorityQueue()
     stop_event = threading.Event()
     detection_thread = None
     threading.Thread(
         target=speech_worker,
-        args=(speech_queue, status_queue),
+        args=(speech_queue, voice_status_queue),
         daemon=True,
     ).start()
 
@@ -260,6 +290,14 @@ def main():
         fg="#FFFFFF",
     )
     status_label.pack(pady=10)
+    voice_status_label = tk.Label(
+        root,
+        text="Voice: Starting...",
+        font=("Helvetica", 10),
+        bg="#2E2E2E",
+        fg="#FFFFFF",
+    )
+    voice_status_label.pack(pady=4)
 
     def start_detection():
         nonlocal detection_thread
@@ -279,6 +317,10 @@ def main():
         stop_event.set()
         status_label.config(text="Status: Stopping...")
 
+    def test_voice():
+        speech_queue.put((0, time.monotonic_ns(), "ChromaNav voice output is working"))
+        status_label.config(text="Status: Voice test queued - will speak next")
+
     def poll_status():
         while True:
             try:
@@ -286,21 +328,19 @@ def main():
             except queue.Empty:
                 break
             status_label.config(text=message)
+        while True:
+            try:
+                message = voice_status_queue.get_nowait()
+            except queue.Empty:
+                break
+            voice_status_label.config(text=f"Voice: {message}")
         if detection_thread is None or not detection_thread.is_alive():
             start_button.config(state=tk.NORMAL)
         root.after(200, poll_status)
 
     def close_app():
         stop_event.set()
-        try:
-            while True:
-                speech_queue.get_nowait()
-        except queue.Empty:
-            pass
-        try:
-            speech_queue.put_nowait(None)
-        except queue.Full:
-            pass
+        speech_queue.put((-1, time.monotonic_ns(), None))
         root.destroy()
 
     start_button = ttk.Button(
@@ -315,6 +355,12 @@ def main():
         command=stop_detection,
     )
     stop_button.pack(side=tk.LEFT, padx=20, pady=10, ipadx=10, ipady=5)
+    voice_button = ttk.Button(
+        button_frame,
+        text="Test Voice",
+        command=test_voice,
+    )
+    voice_button.pack(side=tk.LEFT, padx=20, pady=10, ipadx=10, ipady=5)
 
     root.protocol("WM_DELETE_WINDOW", close_app)
     root.after(200, poll_status)
